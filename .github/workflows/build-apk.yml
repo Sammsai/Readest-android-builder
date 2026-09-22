@@ -78,6 +78,9 @@ jobs:
       - name: Install Dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Copy Vendor Assets (PDF.js & SimpleCC WASM)
+        run: pnpm --filter @readest/readest-app setup-vendors
+
       - name: Build Web Assets (Next.js Static Export)
         run: pnpm --filter readest-app build
 
