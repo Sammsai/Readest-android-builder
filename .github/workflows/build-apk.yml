@@ -8,6 +8,9 @@ on:
         required: true
         default: 'main'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -141,12 +144,35 @@ jobs:
           # 校验签名状态
           "$BUILD_TOOLS_DIR/apksigner" verify --verbose "$APK_PATH"
 
-          # 归档整理
+          # 读取版本号并格式化输出文件名
+          VERSION=$(node -p "require('./apps/readest-app/package.json').version")
+          echo "APP_VERSION=v$VERSION" >> $GITHUB_ENV
+          
           mkdir -p output
-          cp "$APK_PATH" output/readest-selfhosted-arm64-v8a.apk
+          OUTPUT_APK="output/Readest-${VERSION}-arm64-v8a-selfhosted.apk"
+          cp "$APK_PATH" "$OUTPUT_APK"
+          echo "OUTPUT_APK=$OUTPUT_APK" >> $GITHUB_ENV
 
       - name: Upload APK Artifact
         uses: actions/upload-artifact@v7
         with:
           name: readest-selfhosted-arm64-v8a
-          path: output/readest-selfhosted-arm64-v8a.apk
+          path: output/*.apk
+
+      - name: Create GitHub Release and Upload APK
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.APP_VERSION }}
+          name: Readest Android ${{ env.APP_VERSION }} (Self-hosted)
+          body: |
+            ## Readest Android 自建后端专用客户端
+            
+            - **版本**: ${{ env.APP_VERSION }}
+            - **后端地址**: `https://book.zcee.cc`
+            - **架构**: `arm64-v8a`
+            - **签名**: 使用固定密钥签署，支持覆盖升级。
+          files: ${{ env.OUTPUT_APK }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
