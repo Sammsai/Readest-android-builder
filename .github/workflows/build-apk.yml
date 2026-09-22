@@ -78,37 +78,43 @@ jobs:
         run: pnpm --filter @readest/readest-app setup-vendors
 
       - name: Build Web Assets (Next.js Static Export)
-        run: pnpm --filter readest-app build
+        run: pnpm --filter @readest/readest-app build
 
-      - name: Init Tauri Android Project
-        run: pnpm --filter readest-app tauri android init
-
-      - name: Configure Keystore for Gradle & Tauri
+      - name: Init Tauri Android Project & Configure Keystore
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          KEYSTORE_DIR="apps/readest-app/src-tauri/gen/android"
-          mkdir -p "$KEYSTORE_DIR"
-          
-          # 解码永久 Keystore
-          echo "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_DIR/release.jks"
+          cd apps/readest-app
+          rm -rf src-tauri/gen/android
+          pnpm tauri android init
+          pnpm tauri icon ../../data/icons/readest-book.png
 
-          # 写入 Gradle 签名属性
-          cat << EOF > "$KEYSTORE_DIR/keystore.properties"
+          # 仅还原 gen/android 下官方仓库跟踪的文件，不覆盖应用源码
+          git checkout -- src-tauri/gen/android
+
+          # 必须赋予 gradlew 可执行权限，否则 Tauri 无法调用 Gradle (BeforeSpawn 错误)
+          chmod +x src-tauri/gen/android/gradlew
+
+          # 还原永久签名证书
+          base64 -d <<< "$KEYSTORE_BASE64" > "$RUNNER_TEMP/release.jks"
+
+          # 写入 Gradle 签名配置
+          cat << EOF > src-tauri/gen/android/keystore.properties
           password=$KEYSTORE_PASSWORD
           keyAlias=$KEY_ALIAS
           keyPassword=$KEY_PASSWORD
-          storeFile=../release.jks
+          storeFile=$RUNNER_TEMP/release.jks
           EOF
 
       - name: Build Android APK
         env:
           NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
         run: |
-          pnpm --filter readest-app tauri android build --apk --target aarch64
+          cd apps/readest-app
+          pnpm tauri android build --apk --target aarch64
 
       - name: Verify & Final Sign APK with apksigner
         env:
@@ -116,13 +122,14 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          BUILD_TOOLS_DIR="${ANDROID_HOME}/build-tools/34.0.0"
+          BUILD_TOOLS_DIR=$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)
           APK_PATH=$(find apps/readest-app/src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | head -n 1)
           echo "Found APK: $APK_PATH"
+          echo "Using apksigner from: $BUILD_TOOLS_DIR"
 
-          # 使用 apksigner 进行双重加固签名 (v1 + v2 + v3)
+          # 使用固定的永久密钥对 APK 进行加固签名 (v1 + v2 + v3)
           "$BUILD_TOOLS_DIR/apksigner" sign \
-            --ks "apps/readest-app/src-tauri/gen/android/release.jks" \
+            --ks "$RUNNER_TEMP/release.jks" \
             --ks-pass "pass:$KEYSTORE_PASSWORD" \
             --key-pass "pass:$KEY_PASSWORD" \
             --ks-key-alias "$KEY_ALIAS" \
@@ -134,7 +141,7 @@ jobs:
           # 校验签名状态
           "$BUILD_TOOLS_DIR/apksigner" verify --verbose "$APK_PATH"
 
-          # 整理输出产物
+          # 归档整理
           mkdir -p output
           cp "$APK_PATH" output/readest-selfhosted-arm64-v8a.apk
 
