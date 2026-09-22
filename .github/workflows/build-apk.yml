@@ -1,0 +1,150 @@
+name: Build Android APK (Self-hosted)
+
+on:
+  workflow_dispatch:
+    inputs:
+      branch:
+        description: '原作者分支或 tag (默认 main)'
+        required: true
+        default: 'main'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Free Disk Space
+        run: |
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /opt/ghc
+          sudo rm -rf "/usr/local/share/boost"
+          sudo rm -rf "$AGENT_TOOLSDIRECTORY"
+
+      - name: Checkout Upstream Readest
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: readest/readest
+          ref: ${{ github.event.inputs.branch }}
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Setup Java
+        uses: actions/setup-java@de7274f081f381c8f8158605e0321c36c376e2e6 # v6.0.1
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@40fd30fb8d7440372e1316f5d1809ec01dcd3699 # v4
+
+      - name: Install Android NDK & Build Tools
+        run: |
+          sdkmanager --install "ndk;28.2.13676358" "build-tools;34.0.0"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: 24
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 11
+          run_install: false
+
+      - name: Inject Self-hosted Backend Config & Patches
+        run: |
+          # 1. 注入自建后端环境变量
+          cat << 'EOF' > apps/readest-app/.env.production
+          NEXT_PUBLIC_APP_PLATFORM=tauri
+          NEXT_PUBLIC_API_BASE_URL=https://book.zcee.cc
+          NEXT_PUBLIC_SUPABASE_URL=https://book.zcee.cc
+          NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJyb2xlIjoiYW5vbiIsImlzcyI6InN1cGFiYXNlIiwiaWF0IjoxNjAwMDAwMDAwLCJleHAiOjIwMDAwMDAwMDB9.pBBgl_ihwheflqYhxBn_19BiB64zUKe2T_jAQCVsi0c
+          NEXT_PUBLIC_SELF_HOSTED=true
+          NEXT_PUBLIC_OBJECT_STORAGE_TYPE=s3
+          NEXT_PUBLIC_STORAGE_FIXED_QUOTA=10737418240
+          NEXT_PUBLIC_TRANSLATION_FIXED_QUOTA=50000
+          EOF
+
+          cp apps/readest-app/.env.production apps/readest-app/.env.local
+          cp apps/readest-app/.env.production apps/readest-app/.env.tauri.local
+
+          # 2. 补丁：适配 MinIO/S3 存储哈希方案
+          sed -i "s/return 'r2'/return process.env['NEXT_PUBLIC_OBJECT_STORAGE_TYPE'] || 'r2'/g" apps/readest-app/src/utils/storage.ts
+
+          # 3. 补丁：适配自建端无限/固定额度
+          sed -i "s/fixedQuota: 0/fixedQuota: Number(process.env['NEXT_PUBLIC_STORAGE_FIXED_QUOTA'] || 0)/g" apps/readest-app/src/utils/access.ts
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Web Assets (Next.js Static Export)
+        run: pnpm --filter readest-app build
+
+      - name: Init Tauri Android Project
+        run: pnpm --filter readest-app tauri android init
+
+      - name: Configure Keystore for Gradle & Tauri
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          KEYSTORE_DIR="apps/readest-app/src-tauri/gen/android"
+          mkdir -p "$KEYSTORE_DIR"
+          
+          # 解码永久 Keystore
+          echo "$KEYSTORE_BASE64" | base64 -d > "$KEYSTORE_DIR/release.jks"
+
+          # 写入 Gradle 签名属性
+          cat << EOF > "$KEYSTORE_DIR/keystore.properties"
+          password=$KEYSTORE_PASSWORD
+          keyAlias=$KEY_ALIAS
+          keyPassword=$KEY_PASSWORD
+          storeFile=../release.jks
+          EOF
+
+      - name: Build Android APK
+        env:
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/28.2.13676358
+        run: |
+          pnpm --filter readest-app tauri android build --apk --target aarch64
+
+      - name: Verify & Final Sign APK with apksigner
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          BUILD_TOOLS_DIR="${ANDROID_HOME}/build-tools/34.0.0"
+          APK_PATH=$(find apps/readest-app/src-tauri/gen/android/app/build/outputs/apk -name "*.apk" | head -n 1)
+          echo "Found APK: $APK_PATH"
+
+          # 使用 apksigner 进行双重加固签名 (v1 + v2 + v3)
+          "$BUILD_TOOLS_DIR/apksigner" sign \
+            --ks "apps/readest-app/src-tauri/gen/android/release.jks" \
+            --ks-pass "pass:$KEYSTORE_PASSWORD" \
+            --key-pass "pass:$KEY_PASSWORD" \
+            --ks-key-alias "$KEY_ALIAS" \
+            --v1-signing-enabled true \
+            --v2-signing-enabled true \
+            --v3-signing-enabled true \
+            "$APK_PATH"
+
+          # 校验签名状态
+          "$BUILD_TOOLS_DIR/apksigner" verify --verbose "$APK_PATH"
+
+          # 整理输出产物
+          mkdir -p output
+          cp "$APK_PATH" output/readest-selfhosted-arm64-v8a.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: readest-selfhosted-arm64-v8a
+          path: output/readest-selfhosted-arm64-v8a.apk
